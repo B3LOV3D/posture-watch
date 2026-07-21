@@ -181,7 +181,6 @@ def notify(newly_open: dict) -> None:
         "Priority": "urgent",
         "Tags": "bike,rotating_light",
         "Click": APPOINTMENT_URL,
-        "Message": message.encode("utf-8"),
     }
 
     try:
