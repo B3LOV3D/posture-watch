@@ -1,0 +1,39 @@
+name: Paris Bike Co - Posture Watch
+
+on:
+  schedule:
+    # Toutes les heures
+    - cron: "0 * * * *"
+  workflow_dispatch: {}  # permet de lancer manuellement depuis l'onglet Actions
+
+permissions:
+  contents: write  # nécessaire pour que le bot puisse committer l'état
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Lancer la vérification
+        env:
+          NTFY_TOPIC_POSTURE: ${{ secrets.NTFY_TOPIC_POSTURE }}
+        run: python posture_watch.py
+
+      - name: Sauvegarder l'état
+        run: |
+          git config user.name "posture-watch-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add posture_last_available.json
+          git diff --staged --quiet || git commit -m "update posture availability state"
+          git pull --rebase origin main
+          git push
