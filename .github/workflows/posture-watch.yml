@@ -29,12 +29,12 @@ jobs:
           NTFY_TOPIC_POSTURE: ${{ secrets.NTFY_TOPIC_POSTURE }}
         run: python posture_watch.py
 
-      - name: Publier la capture d'écran (pour vérification)
+      - name: Publier les captures d'écran (pour vérification)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: calendar-screenshot
-          path: posture_calendar.png
+          name: calendar-screenshots
+          path: posture_month_*.png
           if-no-files-found: ignore
 
       - name: Sauvegarder l'état
