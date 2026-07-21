@@ -2,12 +2,15 @@
 Paris Bike Co - Surveillance de creneaux (etude posturale velo de route)
 
 Surveille la page de reservation Acuity Scheduling et notifie (via ntfy.sh)
-des qu'une NOUVELLE date/creneau devient disponible.
+des qu'un mois qui etait complet ("No appointments are available this
+month.") a nouveau des places.
 
-Contrairement a FREITAG, ce calendrier est une application JavaScript
-dynamique: on utilise donc un vrai navigateur (Playwright) pour le lire,
-et on prend une capture d'ecran du calendrier a joindre a la notification
-pour verification visuelle rapide.
+On detecte la disponibilite au niveau du MOIS (signal fiable: Acuity
+affiche explicitement "No appointments are available this month." quand
+un mois est complet), plutot qu'au niveau du jour individuel (les jours
+ne sont pas de simples boutons HTML standards, donc peu fiables a
+detecter directement). Une capture d'ecran de chaque mois consulte est
+sauvegardee, pour pouvoir reperer les dates exactes a l'oeil.
 
 Variables d'environnement:
     NTFY_TOPIC_POSTURE  -> nom du topic ntfy.sh (obligatoire)
@@ -22,12 +25,12 @@ from playwright.sync_api import sync_playwright
 
 APPOINTMENT_URL = "https://parisbikeco.as.me/schedule/5d715376/appointment/40208624/calendar/7783875"
 STATE_FILE = "posture_last_available.json"
-SCREENSHOT_FILE = "posture_calendar.png"
+SCREENSHOT_PREFIX = "posture_month"
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC_POSTURE")
 
-# Nombre de fois qu'on clique sur "mois suivant" pour regarder plus loin
-# dans le temps (0 = seulement le mois actuellement affiche).
+# Nombre de fois qu'on clique sur "mois suivant" (0 = uniquement le mois
+# affiche au chargement de la page).
 LOOKAHEAD_CLICKS = 2
 
 UA = (
@@ -36,11 +39,25 @@ UA = (
 )
 
 COOKIE_BUTTON_TEXTS = [
-    "Tout accepter", "Accepter", "J'accepte", "J’accepte",
+    "Tout accepter", "Accepter", "J'accepte", "J'accepte",
     "Accept all", "Accept", "OK",
 ]
 
 NEXT_MONTH_HINTS = ["next", "suivant", "prochain"]
+
+NO_AVAILABILITY_PATTERNS = [
+    re.compile(r"no appointments? (are|is) available", re.IGNORECASE),
+    re.compile(r"no availability", re.IGNORECASE),
+    re.compile(r"aucun[e]? (rendez-vous|creneau|cr[eé]neau)[^.]{0,40}disponible", re.IGNORECASE),
+    re.compile(r"complet", re.IGNORECASE),
+]
+
+MONTH_NAME_PATTERN = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|November|December"
+    r"|janvier|f[eé]vrier|mars|avril|mai|juin|juillet|ao[uû]t|septembre|octobre|novembre|d[eé]cembre)"
+    r"\s+\d{4}",
+    re.IGNORECASE,
+)
 
 
 def dismiss_cookie_banner(page) -> None:
@@ -56,32 +73,40 @@ def dismiss_cookie_banner(page) -> None:
             continue
 
 
-def get_calendar_scope(page):
-    """Essaie de restreindre la recherche a la zone du calendrier, pour
-    eviter de confondre d'autres boutons de la page (menu, cookies, etc.)
-    avec des jours disponibles. Si rien de reconnaissable n'est trouve,
-    on retombe sur la page entiere."""
-    for sel in ["[class*='calendar' i]", "[class*='datepicker' i]", "[role='grid']"]:
-        el = page.query_selector(sel)
-        if el:
-            return el
-    return page
+def get_page_text(page) -> str:
+    try:
+        return page.inner_text("body")
+    except Exception:
+        return ""
 
 
-def collect_available_labels(page) -> set:
-    """Renvoie l'ensemble des libelles (texte ou aria-label) des boutons
-    cliquables (= non desactives) dans la zone du calendrier, qui
-    ressemblent a un jour du mois (contiennent un nombre 1-31)."""
-    scope = get_calendar_scope(page)
-    found = set()
-    buttons = scope.query_selector_all("button:not([disabled])")
-    for b in buttons:
-        label = (b.get_attribute("aria-label") or b.inner_text() or "").strip()
-        if not label or len(label) > 60:
-            continue
-        if re.search(r"\b([1-9]|[12]\d|3[01])\b", label):
-            found.add(label)
-    return found
+def month_label(page_text: str, fallback_index: int) -> str:
+    m = MONTH_NAME_PATTERN.search(page_text)
+    if m:
+        return m.group(0)
+    return f"mois_inconnu_{fallback_index}"
+
+
+def month_has_availability(page_text: str) -> bool:
+    for pat in NO_AVAILABILITY_PATTERNS:
+        if pat.search(page_text):
+            return False
+    return True
+
+
+def count_clickable_day_buttons(page) -> int:
+    """Info de debug seulement (pas utilise pour la decision de notif):
+    compte les <button> non desactives dont le texte ressemble a un
+    numero de jour. Utile pour calibrer si Acuity change de structure."""
+    count = 0
+    try:
+        for b in page.query_selector_all("button:not([disabled])"):
+            label = (b.get_attribute("aria-label") or b.inner_text() or "").strip()
+            if label and len(label) < 20 and re.fullmatch(r"([1-9]|[12]\d|3[01])", label):
+                count += 1
+    except Exception:
+        pass
+    return count
 
 
 def find_next_month_button(page):
@@ -92,8 +117,10 @@ def find_next_month_button(page):
     return None
 
 
-def fetch_available_dates():
-    all_labels = set()
+def fetch_month_states() -> dict:
+    """Retourne un dict {mois_label: True/False (disponibilite)} pour le
+    mois affiche au chargement + les LOOKAHEAD_CLICKS mois suivants."""
+    states = {}
     debug_lines = []
 
     with sync_playwright() as p:
@@ -106,11 +133,22 @@ def fetch_available_dates():
         page.wait_for_timeout(500)
 
         for month_index in range(LOOKAHEAD_CLICKS + 1):
-            labels = collect_available_labels(page)
+            text = get_page_text(page)
+            label = month_label(text, month_index)
+            has_avail = month_has_availability(text)
+            day_buttons = count_clickable_day_buttons(page)
+
+            states[label] = has_avail
             debug_lines.append(
-                f"Mois #{month_index}: {len(labels)} bouton(s) 'jour disponible' trouve(s) -> {sorted(labels)}"
+                f"Mois #{month_index} ({label}): disponibilite={has_avail} "
+                f"(boutons jour detectes en plus, info: {day_buttons})"
             )
-            all_labels |= labels
+
+            screenshot_path = f"{SCREENSHOT_PREFIX}_{month_index}.png"
+            try:
+                page.screenshot(path=screenshot_path, full_page=True)
+            except Exception as e:
+                debug_lines.append(f"Capture d'ecran impossible pour ce mois: {e}")
 
             if month_index < LOOKAHEAD_CLICKS:
                 next_btn = find_next_month_button(page)
@@ -124,71 +162,70 @@ def fetch_available_dates():
                     debug_lines.append(f"Impossible de cliquer sur 'mois suivant': {e}")
                     break
 
-        page.screenshot(path=SCREENSHOT_FILE, full_page=True)
         browser.close()
 
     print("\n".join(debug_lines))
-    return all_labels
+    return states
 
 
-def load_state() -> set:
+def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+            return json.load(f)
+    return {}
 
 
-def save_state(labels: set) -> None:
+def save_state(states: dict) -> None:
     with open(STATE_FILE, "w") as f:
-        json.dump(sorted(labels), f, indent=2, ensure_ascii=False)
+        json.dump(states, f, indent=2, ensure_ascii=False)
 
 
-def notify(new_labels: set) -> None:
-    message = "Nouveau(x) creneau(x) possible(s):\n" + "\n".join(sorted(new_labels))
+def notify(newly_open_months: list) -> None:
+    message = "Nouvelle disponibilite detectee pour:\n" + "\n".join(newly_open_months)
+    message += "\n\nOuvre le lien pour voir les dates exactes et reserver."
 
     if not NTFY_TOPIC:
         print(f"[SANS NOTIF - NTFY_TOPIC_POSTURE absent] {message}")
         return
 
     headers = {
-        "Title": "Etude posturale velo route - creneau dispo",
-        "Priority": "high",
+        "Title": "Etude posturale velo route - creneau dispo !",
+        "Priority": "urgent",
         "Tags": "bike,rotating_light",
         "Click": APPOINTMENT_URL,
-        "Filename": "calendrier.png",
         "Message": message.encode("utf-8"),
     }
 
     try:
-        if os.path.exists(SCREENSHOT_FILE):
-            with open(SCREENSHOT_FILE, "rb") as f:
-                requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=f.read(), headers=headers, timeout=20)
-        else:
-            requests.post(
-                f"https://ntfy.sh/{NTFY_TOPIC}",
-                data=message.encode("utf-8"),
-                headers={k: v for k, v in headers.items() if k not in ("Filename",)},
-                timeout=20,
-            )
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers=headers,
+            timeout=20,
+        )
         print("Notification envoyee.")
     except Exception as e:
         print(f"Echec de la notification: {e}")
 
 
 def main() -> None:
-    current_labels = fetch_available_dates()
-    previous_labels = load_state()
+    current_states = fetch_month_states()
+    previous_states = load_state()
 
-    new_labels = current_labels - previous_labels
+    newly_open = [
+        label for label, has_avail in current_states.items()
+        if has_avail and not previous_states.get(label, False)
+    ]
 
-    print(f"{len(current_labels)} creneau(x)/jour(s) disponible(s) actuellement.")
-    if new_labels:
-        print(f"Nouveau(x) depuis la derniere verification: {sorted(new_labels)}")
-        notify(new_labels)
+    print(f"Etat actuel: {current_states}")
+
+    if newly_open:
+        print(f"Nouvelle(s) disponibilite(s): {newly_open}")
+        notify(newly_open)
     else:
         print("Rien de nouveau depuis la derniere verification.")
 
-    save_state(current_labels)
+    save_state(current_states)
 
 
 if __name__ == "__main__":
