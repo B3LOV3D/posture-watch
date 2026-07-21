@@ -2,15 +2,12 @@
 Paris Bike Co - Surveillance de creneaux (etude posturale velo de route)
 
 Surveille la page de reservation Acuity Scheduling et notifie (via ntfy.sh)
-des qu'un mois qui etait complet ("No appointments are available this
-month.") a nouveau des places.
+des qu'un NOUVEAU jour devient disponible.
 
-On detecte la disponibilite au niveau du MOIS (signal fiable: Acuity
-affiche explicitement "No appointments are available this month." quand
-un mois est complet), plutot qu'au niveau du jour individuel (les jours
-ne sont pas de simples boutons HTML standards, donc peu fiables a
-detecter directement). Une capture d'ecran de chaque mois consulte est
-sauvegardee, pour pouvoir reperer les dates exactes a l'oeil.
+Detection: les jours cliquables du calendrier sont des <button> HTML non
+desactives dont le texte est un simple nombre (1-31). On compare, pour
+chaque mois consulte, la liste des jours disponibles avec celle de la
+verification precedente.
 
 Variables d'environnement:
     NTFY_TOPIC_POSTURE  -> nom du topic ntfy.sh (obligatoire)
@@ -39,18 +36,18 @@ UA = (
 )
 
 COOKIE_BUTTON_TEXTS = [
-    "Tout accepter", "Accepter", "J'accepte", "J'accepte",
+    "Tout accepter", "Accepter", "J'accepte",
     "Accept all", "Accept", "OK",
 ]
 
 NEXT_MONTH_HINTS = ["next", "suivant", "prochain"]
 
-NO_AVAILABILITY_PATTERNS = [
-    re.compile(r"no appointments? (are|is) available", re.IGNORECASE),
-    re.compile(r"no availability", re.IGNORECASE),
-    re.compile(r"aucun[e]? (rendez-vous|creneau|cr[eé]neau)[^.]{0,40}disponible", re.IGNORECASE),
-    re.compile(r"complet", re.IGNORECASE),
-]
+# Message specifique affiche par Acuity pour UN MOIS DONNE quand il est
+# complet (ne pas confondre avec le texte d'avertissement general en haut
+# de page, qui contient aussi le mot "complet" mais s'affiche tout le
+# temps, disponibilite ou non - piege qu'on evite en ne s'en servant plus
+# comme critere de decision, juste comme info de log).
+NO_AVAILABILITY_HINT = re.compile(r"no appointments? (are|is) available", re.IGNORECASE)
 
 MONTH_NAME_PATTERN = re.compile(
     r"(January|February|March|April|May|June|July|August|September|October|November|December"
@@ -61,7 +58,6 @@ MONTH_NAME_PATTERN = re.compile(
 
 
 def dismiss_cookie_banner(page) -> None:
-    """Ferme la banniere de cookies si elle est presente (best-effort)."""
     for text in COOKIE_BUTTON_TEXTS:
         try:
             btn = page.get_by_text(text, exact=False).first
@@ -87,26 +83,18 @@ def month_label(page_text: str, fallback_index: int) -> str:
     return f"mois_inconnu_{fallback_index}"
 
 
-def month_has_availability(page_text: str) -> bool:
-    for pat in NO_AVAILABILITY_PATTERNS:
-        if pat.search(page_text):
-            return False
-    return True
-
-
-def count_clickable_day_buttons(page) -> int:
-    """Info de debug seulement (pas utilise pour la decision de notif):
-    compte les <button> non desactives dont le texte ressemble a un
-    numero de jour. Utile pour calibrer si Acuity change de structure."""
-    count = 0
+def collect_available_days(page) -> set:
+    """Jours (nombres 1-31) dont le bouton calendrier est cliquable
+    (non desactive) - donc disponibles a la reservation."""
+    days = set()
     try:
         for b in page.query_selector_all("button:not([disabled])"):
             label = (b.get_attribute("aria-label") or b.inner_text() or "").strip()
             if label and len(label) < 20 and re.fullmatch(r"([1-9]|[12]\d|3[01])", label):
-                count += 1
+                days.add(label)
     except Exception:
         pass
-    return count
+    return days
 
 
 def find_next_month_button(page):
@@ -118,8 +106,7 @@ def find_next_month_button(page):
 
 
 def fetch_month_states() -> dict:
-    """Retourne un dict {mois_label: True/False (disponibilite)} pour le
-    mois affiche au chargement + les LOOKAHEAD_CLICKS mois suivants."""
+    """Retourne {mois_label: [jours disponibles (str), tries]}"""
     states = {}
     debug_lines = []
 
@@ -135,13 +122,13 @@ def fetch_month_states() -> dict:
         for month_index in range(LOOKAHEAD_CLICKS + 1):
             text = get_page_text(page)
             label = month_label(text, month_index)
-            has_avail = month_has_availability(text)
-            day_buttons = count_clickable_day_buttons(page)
+            days = collect_available_days(page)
+            no_avail_message_present = bool(NO_AVAILABILITY_HINT.search(text))
 
-            states[label] = has_avail
+            states[label] = sorted(days, key=int)
             debug_lines.append(
-                f"Mois #{month_index} ({label}): disponibilite={has_avail} "
-                f"(boutons jour detectes en plus, info: {day_buttons})"
+                f"Mois #{month_index} ({label}): jours disponibles = {sorted(days, key=int)} "
+                f"(message 'complet' Acuity present: {no_avail_message_present})"
             )
 
             screenshot_path = f"{SCREENSHOT_PREFIX}_{month_index}.png"
@@ -180,9 +167,10 @@ def save_state(states: dict) -> None:
         json.dump(states, f, indent=2, ensure_ascii=False)
 
 
-def notify(newly_open_months: list) -> None:
-    message = "Nouvelle disponibilite detectee pour:\n" + "\n".join(newly_open_months)
-    message += "\n\nOuvre le lien pour voir les dates exactes et reserver."
+def notify(newly_open: dict) -> None:
+    lines = [f"{month}: jour(s) {', '.join(days)}" for month, days in newly_open.items()]
+    message = "Nouveau(x) creneau(x) disponible(s) !\n" + "\n".join(lines)
+    message += "\n\nClique pour reserver avant que ca parte."
 
     if not NTFY_TOPIC:
         print(f"[SANS NOTIF - NTFY_TOPIC_POSTURE absent] {message}")
@@ -212,15 +200,17 @@ def main() -> None:
     current_states = fetch_month_states()
     previous_states = load_state()
 
-    newly_open = [
-        label for label, has_avail in current_states.items()
-        if has_avail and not previous_states.get(label, False)
-    ]
+    newly_open = {}
+    for month, days in current_states.items():
+        previous_days = set(previous_states.get(month, []))
+        new_days = sorted(set(days) - previous_days, key=int)
+        if new_days:
+            newly_open[month] = new_days
 
     print(f"Etat actuel: {current_states}")
 
     if newly_open:
-        print(f"Nouvelle(s) disponibilite(s): {newly_open}")
+        print(f"Nouveau(x): {newly_open}")
         notify(newly_open)
     else:
         print("Rien de nouveau depuis la derniere verification.")
