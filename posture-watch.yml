@@ -2,8 +2,7 @@ name: Paris Bike Co - Posture Watch
 
 on:
   schedule:
-    # Toutes les heures
-    - cron: "0 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}  # permet de lancer manuellement depuis l'onglet Actions
 
 permissions:
